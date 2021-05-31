@@ -1,0 +1,882 @@
+---
+title: "Elo Merchant Category Recommendation EDA"
+output:
+  html_document:
+    fig_height: 4
+    fig_width: 8
+    theme: cosmo
+    highlight: tango
+    number_sections: true
+    fig_caption: true
+    toc: true
+---
+
+# Introduction
+
+Here is an Exploratory Data Analysis for the Elo Merchant Category Recommendation competition 
+within the R environment. For this EDA we will use the [tidyverse](https://www.tidyverse.org/packages/) packages. 
+Our task is to build an algorithm that helps to identify and serve the most relevant opportunities to individuals,
+by uncovering signal in customer loyalty. 
+
+Submissions are scored on the root mean squared error, which is defined as:
+
+$$RMSE = \sqrt{\frac{1}{n} \sum_{i=1}^n (y_i - \widehat{y_i})^2},$$
+
+where $\widehat{y}$ is the predicted loyalty score for each **card_id**, and y is the actual loyalty score 
+assigned to a **card_id**.
+
+Let's prepare and have a look at the dataset.
+
+# Preparations {.tabset .tabset-fade}
+## Load libraries
+```{r, message=FALSE, warning=FALSE, results='hide'}
+library(GA)
+library(Metrics)
+library(corrplot)
+library(Rmisc)
+library(lubridate)
+library(scales)
+library(lightgbm)
+library(xgboost)
+library(keras)
+library(magrittr)
+library(tidyverse)
+```
+
+## Load data
+```{r load, message=FALSE, warning=FALSE, results='hide'}
+set.seed(0)
+
+tr <- read_csv("../input/train.csv") 
+te <- read_csv("../input/test.csv")
+htrans <- read_csv("../input/historical_transactions.csv") 
+ntrans <- read_csv("../input/new_merchant_transactions.csv")
+merchants <- read_csv("../input/merchants.csv")
+subm <- read_csv("../input/sample_submission.csv")
+```
+
+# General info {.tabset .tabset-fade}
+## Train
+```{r result='asis', echo=FALSE}
+cat("File size:", file.size("../input/train.csv"), "bytes")
+cat("Dimensions:", dim(tr))
+cat("Missing values:",  sum(is.na(tr)))
+glimpse(tr)
+```
+## Test
+```{r result='asis', echo=FALSE}
+cat("File size:", file.size("../input/test.csv"), "bytes")
+cat("Dimensions:", dim(te))
+cat("Missing values:",  sum(is.na(te)))
+glimpse(te)
+```
+## Historical TX
+```{r result='asis', echo=FALSE}
+cat("File size:", file.size("../input/historical_transactions.csv"), "bytes")
+cat("Dimensions:", dim(htrans))
+cat("Missing values:",  sum(is.na(htrans)))
+glimpse(htrans)
+```
+## New merchant TX
+```{r result='asis', echo=FALSE}
+cat("File size:", file.size("../input/new_merchant_transactions.csv"), "bytes")
+cat("Dimensions:", dim(ntrans))
+cat("Missing values:",  sum(is.na(ntrans)))
+glimpse(ntrans)
+```
+## Merchants
+```{r result='asis', echo=FALSE}
+cat("File size:", file.size("../input/merchants.csv"), "bytes")
+cat("Dimensions:", dim(merchants))
+cat("Missing values:",  sum(is.na(merchants)))
+glimpse(merchants)
+```
+## Sample Submission
+```{r result='asis', echo=FALSE}
+cat("File size:", file.size("../input/sample_submission.csv"), "bytes")
+cat("Dimensions:", dim(subm))
+cat("Missing values:",  sum(is.na(subm)))
+glimpse(subm)
+```
+
+# Train/test
+## Features
+There is a total of 5 features:
+
+* **card_id** - unique card identifier
+* **first_active_month** - 'YYYY-MM', month of first purchase
+* **feature_1** - anonymized card categorical feature
+* **feature_2** - anonymized card categorical feature
+* **feature_3** - anonymized card categorical feature
+
+Let's plot how the dates of the first purchases are distributed:
+```{r dates_distr, result='asis', message=FALSE, warning=FALSE, echo=FALSE}
+tr %>% 
+  bind_rows(te) %>% 
+  mutate(set = factor(if_else(is.na(target), "Test", "Train")),
+         first_active_month = ymd(first_active_month, truncated = 1)) %>% 
+  ggplot(aes(x = first_active_month, fill = set)) +
+  geom_bar() +
+  theme_minimal()
+```  
+
+The distributions are quite similar - this makes cross-validation easier.
+
+Let's have a look at the counts of the anonymized features:
+```{r tr1, result='asis',  warning=FALSE, echo=FALSE, fig.align='center'}
+tr %>% 
+  bind_rows(te) %>% 
+  mutate(set = factor(if_else(is.na(target), "Test", "Train"))) %>% 
+  select(-first_active_month, -card_id, -target) %>% 
+  gather(key = "feature", value = "value", -set) %>% 
+  mutate(value = factor(value)) %>% 
+  ggplot(aes(value, fill = set)) +
+  geom_bar(aes(y=..prop.., group = 1)) +
+  scale_y_continuous(labels = percent_format()) + 
+  facet_wrap(set ~ feature, scales = "free") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+We can observe almost identical distributions within train and test sets. These features
+look like stratified 2-folds - perfectly simulated data.
+
+## Target
+```{r tr2, result='asis',  warning=FALSE, echo=FALSE}
+summary(tr$target)
+```
+
+This is how the mean and sum target changes over the time - there is a growing trend for the mean value.
+
+```{r tr21, result='asis',  warning=FALSE, echo=FALSE, fig.align='center'}
+tr %>% 
+  select(first_active_month, target) %>% 
+  mutate(first_active_month = ymd(first_active_month, truncated = 1)) %>% 
+  group_by(first_active_month) %>% 
+  summarise_all(funs(sum, mean)) %>% 
+  ungroup() %>% 
+  gather(key = "feature", value = "value", -first_active_month) %>% 
+  ggplot(aes(x = first_active_month, y = value, colour = feature)) +
+  geom_smooth() +
+  facet_wrap(~ feature, ncol = 1, scales = "free") + 
+  theme_minimal() + 
+  theme(legend.position="none")
+```
+
+```{r tr3, result='asis',  warning=FALSE, echo=FALSE, fig.align='center'}
+tr %>% 
+  ggplot(aes(target)) +
+  geom_histogram(bins = 100, fill = "steelblue") +
+  theme_minimal()
+```
+
+From the histogram it is clear that there are `r sum(tr$target < -30)` outliers less than -30. We should regard this 
+while building a statistical model - maybe, it'd be better to remove them. Let's
+find out the **card_id** for the outliers:
+```{r tr4, result='asis',  warning=FALSE, echo=TRUE}
+tr %>% 
+  select(card_id, target) %>% 
+  filter(target < -30) %>% 
+  head()
+```
+
+This is strange that all outliers are qual to `r unique(tr$target[tr$target < -30])`.
+
+## Correlations
+Let's convert categorical features to dummy variables and check correlations:
+
+```{r tr5, result='asis',  warning=FALSE, echo=TRUE, fig.align='center'}
+tr %>% 
+  mutate(feature_1 = factor(feature_1),
+         feature_2 = factor(feature_2),
+         feature_2 = factor(feature_2)) %>% 
+  select(-first_active_month, -card_id) %>% 
+  model.matrix(~.-1, .) %>% 
+  cor(method = "spearman") %>%
+  corrplot(type="lower", method = "number", tl.col = "black", diag=FALSE, tl.cex = 0.9, number.cex = 0.9)
+```
+
+No one column from the train set correlates with the **target**, but there is a strong correlation
+between **feature_1** and **feature_3**.
+
+# Historical and new merchant transactions
+## Features
+There is a total of 14 features in each dataset:
+
+* **card_id** - card identifier
+* **month_lag** - month lag to reference date
+* **purchase_date** - purchase date
+* **authorized_flag** - 'Y' if approved, 'N' if denied
+* **category_3** - anonymized category
+* **installments** - number of installments of purchase
+* **category_1** - anonymized category
+* **merchant_category_id** - merchant category identifier (anonymized)
+* **subsector_id** - merchant category group identifier (anonymized)
+* **merchant_id** - merchant identifier (anonymized)
+* **purchase_amount** - normalized purchase amount
+* **city_id** - city identifier (anonymized)
+* **state_id** - state identifier (anonymized)
+* **category_2** - anonymized category
+
+As the set with historical transactions is quite large we will sample no more than $6 \cdot 10^6$ rows.
+Let's plot some categorical features:
+
+```{r dht5, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.align='center'}
+p1 <- htrans %>%
+  sample_n(6e6) %>% 
+  select(authorized_flag, category_1, category_2, category_3) %>% 
+  mutate(category_2 = as.character(category_2)) %>% 
+  gather(key = "feature", value = "value") %>% 
+  mutate(value = factor(value)) %>% 
+  ggplot(aes(value, fill = feature)) +
+  geom_bar(aes(y = ..prop.., group = 1)) +
+  scale_y_continuous(labels = percent_format()) + 
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  ggtitle("Historical") +
+  theme(legend.position = "none")
+p2 <- ntrans %>%
+  select(authorized_flag, category_1, category_2, category_3) %>% 
+  mutate(category_2 = as.character(category_2)) %>% 
+  gather(key = "feature", value = "value") %>% 
+  mutate(value = factor(value)) %>% 
+  ggplot(aes(value, fill = feature)) +
+  geom_bar(aes(y = ..prop.., group = 1)) +
+  scale_y_continuous(labels = percent_format()) + 
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  ggtitle("New") +
+  theme(legend.position = "none")
+multiplot(p1, p2, cols = 2)
+```
+
+The **authorized_flag** from the new TX datset is constant and can be removed.
+The distributions of the **category_2** features form both sets are similar.
+
+The next figures show the **id's** with the largest mean **purchase_amount**:
+
+```{r dht6, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.height = 5.5, fig.width = 7, fig.align='center'}
+htrans %>%
+  sample_n(6e6) %>% 
+  select(contains("_id"), purchase_amount) %>% 
+  mutate_all(as.character) %>% 
+  mutate(purchase_amount = as.numeric(purchase_amount)) %>% 
+  gather(key = "id", value = "value", -purchase_amount) %>% 
+  group_by(id, value) %>% 
+  summarise_all(mean) %>% 
+  arrange(desc(purchase_amount)) %>% 
+  slice(1:5) %>% 
+  ungroup() %>% 
+  mutate(value = factor(value), 
+         id = factor(id)) %>% 
+  ggplot(aes(x = value, y = purchase_amount, fill = id)) +
+  geom_col() +
+  facet_wrap(~ id, scales = "free") +
+  theme_minimal() +
+  ggtitle("Historical") +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1)) 
+```
+```{r dht7, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.height = 5.5, fig.width = 7, fig.align='center'}
+ntrans %>%
+  select(contains("_id"), purchase_amount) %>% 
+  mutate_all(as.character) %>% 
+  mutate(purchase_amount = as.numeric(purchase_amount)) %>% 
+  gather(key = "id", value = "value", -purchase_amount) %>% 
+  group_by(id, value) %>% 
+  summarise_all(mean) %>% 
+  arrange(desc(purchase_amount)) %>% 
+  slice(1:5) %>% 
+  ungroup() %>% 
+  mutate(value = factor(value), 
+         id = factor(id)) %>% 
+  ggplot(aes(x = value, y = purchase_amount, fill = id)) +
+  geom_col() +
+  facet_wrap(~ id, scales = "free") +
+  theme_minimal() +
+  ggtitle("New") +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1)) 
+```
+
+-1 in **city_id** and **state_id** can stand for the **NA** value.
+
+## Time plots
+Let's see how the purchases are distributed in time:
+
+```{r dht1, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.align='center'}
+p1 <- htrans %>%
+  sample_n(6e6) %>% 
+  mutate(date = format(purchase_date, "%Y-%m")) %>% 
+  ggplot(aes(x = date)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Historical")
+p2 <- ntrans %>%
+  mutate(date = format(purchase_date, "%Y-%m")) %>% 
+  ggplot(aes(x = date)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("New")
+multiplot(p1, p2, cols=2)
+```  
+
+```{r dht2, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.align='center'}
+p1 <- htrans %>% 
+  sample_n(6e6) %>% 
+  mutate(hour = hour(purchase_date)) %>% 
+  ggplot(aes(x = hour)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  ggtitle("Historical")
+p2 <- ntrans %>% 
+  mutate(hour = hour(purchase_date)) %>% 
+  ggplot(aes(x = hour)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  ggtitle("New")
+multiplot(p1, p2, cols=2)
+```  
+
+The most unpopular hours for purchases are from 1 to 6. The next figures show how the
+averages of the normalized purchase amount and installments change in time: 
+
+```{r dht3, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.align='center'}
+p1 <- htrans %>%
+  sample_n(6e6) %>% 
+  mutate(date = format(purchase_date, "%Y-%m")) %>% 
+  group_by(date) %>% 
+  summarise(mean_amount = mean(purchase_amount)) %>% 
+  ggplot(aes(x = date, y = mean_amount, group = 1)) +
+  geom_smooth()+
+  theme_minimal() + 
+  ggtitle("Historical") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+p2 <- ntrans %>%
+  mutate(date = format(purchase_date, "%Y-%m")) %>% 
+  group_by(date) %>% 
+  summarise(mean_amount = mean(purchase_amount)) %>% 
+  ggplot(aes(x = date, y = mean_amount, group = 1)) +
+  geom_smooth()+
+  theme_minimal() + 
+  ggtitle("New") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+multiplot(p1, p2, cols = 2)
+```  
+```{r dht4, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.align='center'}
+p1 <- htrans %>%
+  sample_n(6e6) %>% 
+  mutate(date = format(purchase_date, "%Y-%m")) %>% 
+  group_by(date) %>% 
+  summarise(mean_installments = mean(installments)) %>% 
+  ggplot(aes(x = date, y = mean_installments, group = 1)) +
+  geom_smooth()+
+  theme_minimal() + 
+  ggtitle("Historical") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+p2 <- ntrans %>%
+  mutate(date = format(purchase_date, "%Y-%m")) %>% 
+  group_by(date) %>% 
+  summarise(mean_installments = mean(installments)) %>% 
+  ggplot(aes(x = date, y = mean_installments, group = 1)) +
+  geom_smooth()+
+  theme_minimal() + 
+  ggtitle("New") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+multiplot(p1, p2, cols = 2)
+```  
+
+The pattern for the **mean_amount** and **mean_installments** from the new TX dataset is pretty the same.
+
+# Merchants
+There is a total of 22 features:
+
+* **merchant_id**	- unique merchant identifier
+* **merchant_group_id**	- merchant group (anonymized )
+* **merchant_category_id** - unique identifier for merchant category (anonymized )
+* **subsector_id** - merchant category group (anonymized )
+* **numerical_1** - anonymized measure
+* **numerical_2** - anonymized measure
+* **category_1** - anonymized category
+* **most_recent_sales_range** - range of revenue (monetary units) in last active month --> A > B > C > D > E
+* **most_recent_purchases_range** - range of quantity of transactions in last active month --> A > B > C > D > E
+* **avg_sales_lag3** - monthly average of revenue in last 3 months divided by revenue in last active month
+* **avg_purchases_lag3** - monthly average of transactions in last 3 months divided by transactions in last active month
+* **active_months_lag3** - quantity of active months within last 3 months
+* **avg_sales_lag6** - monthly average of revenue in last 6 months divided by revenue in last active month
+* **avg_purchases_lag6** - monthly average of transactions in last 6 months divided by transactions in last active month
+* **active_months_lag6** - quantity of active months within last 6 months
+* **avg_sales_lag12** - monthly average of revenue in last 12 months divided by revenue in last active month
+* **avg_purchases_lag12** - monthly average of transactions in last 12 months divided by transactions in last active month
+* **active_months_lag12** - quantity of active months within last 12 months
+* **category_4** - anonymized category
+* **city_id** - city identifier (anonymized )
+* **state_id** - sState identifier (anonymized )
+* **category_2** - anonymized category
+
+This additional dataset contains many numerical and lagged features. Let's plot their distributions:
+
+```{r m1, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.align='center'}
+merchants %>%
+  select(contains("num")) %>% 
+  gather(key = "feature", value = "value", factor_key = TRUE) %>% 
+  mutate(value = ifelse(is.infinite(value), NA, value)) %>% 
+  group_by(feature) %>% 
+  mutate(mean = mean(value, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = value, fill = feature)) +
+  geom_density() +
+  geom_vline(aes(xintercept = mean, colour = feature), linetype = "dashed") +
+  scale_x_continuous(limits=c(-0.05, 0.15)) + 
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+These beautiful curves look like damped oscillations.
+
+```{r m2, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.height = 6, fig.align='center'}
+merchants %>%
+  select(contains("lag")) %>% 
+  gather(key = "feature", value = "value", factor_key = TRUE) %>% 
+  mutate(value = ifelse(is.infinite(value), NA, value)) %>% 
+  ggplot(aes(x = value, fill = feature)) +
+  geom_density() +
+  scale_x_continuous(limits=c(0, 5)) + 
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+```{r m3, result='hide', message=FALSE, warning=FALSE, echo=FALSE}
+
+```
+
+It seems that those anonymized numerical features are some kind of lag features.
+
+# Basic models
+## Data preparation
+First, let's split historical transactions by **authorized_flag** and create some aggregations and features:
+```{r d1, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+htrans_auth <- htrans %>% 
+  filter(authorized_flag == "Y") %>% 
+  select(-authorized_flag) %>% 
+  rename(card = card_id)
+
+htrans <- htrans %>% 
+  filter(authorized_flag == "N") %>% 
+  select(-authorized_flag) %>% 
+  rename(card = card_id)
+
+ntrans %<>% 
+  left_join(merchants, by = "merchant_id", suffix = c("", "_mer")) %>%
+  select(-authorized_flag) %>% 
+  rename(card = card_id)  
+
+rm(merchants); invisible(gc())  
+```
+Here I use **assign()** function to assign a value to a name in an environment. This allows me to re-use
+the same code for three sets of transactions:
+```{r d2, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+for (tx in c("htrans_auth", "htrans", "ntrans")) {
+
+  ohe <- paste0("ohe_", tx)
+  assign(ohe,
+         get(tx) %>%
+           select(starts_with("category"), starts_with("most_recent")) %>% 
+           mutate_all(factor) %>% 
+           model.matrix.lm(~ . - 1, ., na.action = NULL) %>% 
+           as_tibble())
+  
+  fn <- funs(mean, sd, min, max, sum, n_distinct, .args = list(na.rm = TRUE))
+  
+  sum_tx <- paste0("sum_", tx) 
+  assign(sum_tx, 
+         get(tx) %>%
+           select(-starts_with("category"), -starts_with("most_recent"), -contains("_id")) %>% 
+           add_count(card) %>%
+           group_by(card) %>%
+           mutate(date_diff = as.integer(diff(range(purchase_date))),
+                  prop = n() / sum(n)) %>% 
+           ungroup() %>% 
+           mutate(year = year(purchase_date),
+                  month = month(purchase_date),
+                  day = day(purchase_date),
+                  hour = hour(purchase_date),
+                  month_diff = as.integer(ymd("2018-12-01") - date(purchase_date)) / 30 + month_lag) %>% 
+           select(-purchase_date) %>% 
+           bind_cols(get(ohe)) %>% 
+           group_by(card) %>%
+           summarise_all(fn))
+           
+  rm(list = c(ohe, tx, "fn", "ohe", "sum_tx"))
+  gc()
+}
+```
+Second, let's join datasets:
+```{r d3, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+y <- tr$target
+tri <- 1:nrow(tr)
+```
+```{r d4, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+tr_te <- tr %>% 
+  select(-target) %>% 
+  bind_rows(te) %>%
+  rename(card = card_id) %>% 
+  mutate(first_active_month = ymd(first_active_month, truncated = 1),
+         year = year(first_active_month),
+         month = month(first_active_month),
+         date_diff = as.integer(ymd("2018-02-01") - first_active_month),
+         weekend = as.integer(wday(first_active_month) %in% c(1, 7))) %>% 
+  select(-first_active_month) %>% 
+  left_join(sum_htrans_auth, by = "card") %>% 
+  left_join(sum_htrans, by = "card") %>% 
+  left_join(sum_ntrans, by = "card") %>% 
+  select(-card) %>% 
+  mutate_all(funs(ifelse(is.infinite(.), NA, .))) %>% 
+  mutate_all(funs(ifelse(is.na(.), 0, .))) %>%
+  select_if(~ n_distinct(.x) > 1) %>% 
+  data.matrix()
+  
+cols <- colnames(tr_te)  
+```
+```{r d5, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+rm(tr, te, sum_htrans_auth, sum_htrans, sum_ntrans, tx)
+invisible(gc())
+```
+I will use the function below to plot feature importances:
+```{r d6, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+plot_imp <- function(imp, title)
+  imp %>% 
+  group_by(Feature) %>% 
+  summarise_all(funs(mean)) %>% 
+  arrange(desc(Gain)) %>% 
+  top_n(25, Gain) %>% 
+  ungroup() %>% 
+  ggplot(aes(reorder(Feature, Gain), Gain)) + 
+  geom_col(fill = "steelblue") +
+  xlab("Feature") +
+  ggtitle(title) +
+  coord_flip() +
+  theme_minimal()
+```
+
+## LightGBM
+GBM is a very useful model, which also helps to detect the most important variables. 
+Here I use a [lightgbm](https://github.com/Microsoft/LightGBM/tree/master/R-package) package. 
+Also I create out-of-fold predictions for an ensemble model:
+```{r gbm1, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+p <- list(boosting_type = "gbdt",
+          objective = "regression_l2",
+          metric ="rmse",
+          nthread = 4,
+          learning_rate = 0.005,
+          max_depth = -1, 
+          sub_feature = 0.8,
+          sub_row = 0.85,
+          bagging_freq = 1,
+          lambda_l1 = 0,
+          lambda_l2 = 0.1)
+
+nfolds <- 6
+skf <- caret::createFolds(y, k = nfolds)
+pred_tr_gbm <- rep(0, nrow(tr_te[tri, ]))
+pred_te_gbm <- rep(0, nrow(tr_te[-tri, ]))
+imp <- tibble(Feature = colnames(tr_te), Gain = 0, Cover = 0, Frequency = 0)
+
+for (i in seq_along(skf)){
+  cat("\nFold:", i, "\n")
+  idx <- skf[[i]]
+  
+  xtrain <- lgb.Dataset(data = tr_te[tri, ][-idx, ], label = y[-idx])
+  xval <- lgb.Dataset(data = tr_te[tri, ][idx, ], label = y[idx])
+  
+  m_gbm <- lgb.train(p, xtrain, 10000, list(val = xval), eval_freq = 400,
+                     early_stopping_rounds = 400, verbose = 1)
+
+  pred_tr_gbm[idx] <- predict(m_gbm, tr_te[tri, ][idx, ])
+  pred_te_gbm <- pred_te_gbm + predict(m_gbm, tr_te[-tri, ]) / nfolds
+  imp %<>% bind_rows(lgb.importance(m_gbm))
+  
+  rm(m_gbm, xtrain, xval); invisible(gc())
+}
+
+plot_imp(imp, "GBM") 
+```
+```{r gbm2, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+read_csv("../input/sample_submission.csv") %>%  
+  mutate(target = pred_te_gbm) %>%
+  write_csv("tidy_gbm_elo.csv")
+```
+
+## XGB
+```{r xgb1, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.02,
+          max_depth = 7,
+          min_child_weight = 100,
+          gamma = 0,
+          subsample = 0.85,
+          colsample_bytree = 0.8,
+          colsample_bylevel = 0.85,
+          alpha = 0,
+          lambda = 0.1)
+
+pred_tr_xgb <- rep(0, nrow(tr_te[tri, ]))
+pred_te_xgb <- rep(0, nrow(tr_te[-tri, ]))
+imp <- tibble(Feature = colnames(tr_te), Gain = 0, Cover = 0, Frequency = 0)
+
+for (i in seq_along(skf)){
+  cat("\nFold:", i, "\n")
+  idx <- skf[[i]]
+  
+  xtrain <- xgb.DMatrix(data = tr_te[tri, ][-idx, ], label = y[-idx])
+  xval <- xgb.DMatrix(data = tr_te[tri, ][idx, ], label = y[idx]) 
+  
+  m_xgb <- xgb.train(p, xtrain, 2000, list(val = xval), 
+                     print_every_n = 200, early_stopping_rounds = 200)
+  
+  pred_tr_xgb[idx] <- predict(m_xgb, tr_te[tri, ][idx, ])
+  pred_te_xgb <- pred_te_xgb + predict(m_xgb, tr_te[-tri, ]) / nfolds
+  imp %<>% bind_rows(xgb.importance(cols, m_xgb))
+  
+  rm(m_xgb, xtrain, xval); invisible(gc())
+}
+
+plot_imp(imp, "XGB") 
+```
+```{r xgb2, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+read_csv("../input/sample_submission.csv") %>%  
+  mutate(target = pred_te_xgb) %>%
+  write_csv("tidy_xgb_elo.csv")
+```
+
+## Keras
+To train a neural net we have to scale data:
+```{r ks1, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+X <- scale(tr_te[tri, ])
+X_te <- scale(tr_te[-tri, ], center = attr(X, "scaled:center"), scale = attr(X, "scaled:scale"))
+```
+Let's define a custom loss function and a model structure:
+```{r ks2, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+root_mean_squared_error <- function(y_true, y_pred)
+  k_sqrt(k_mean(k_square(y_pred - y_true))) 
+
+def_nn <- function(){
+  m_nn <- keras_model_sequential() %>% 
+    layer_dense(64, "relu", input_shape = dim(tr_te)[2]) %>% 
+    layer_batch_normalization() %>% 
+    layer_dense(16, "tanh") %>% 
+    layer_dense(1)
+  
+  m_nn %>% keras::compile(optimizer = "adam",
+                          loss = root_mean_squared_error)
+  
+  return(m_nn)
+}
+```
+Also here we use early stopping callback with checkpoints:
+```{r ks3, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+early_stopping <- callback_early_stopping(patience = 10)
+check_point <- callback_model_checkpoint("model.h5", save_best_only = TRUE, verbose = 0, mode = "min")
+```
+```{r ks4, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+pred_tr_nn <- rep(0, nrow(tr_te[tri, ]))
+pred_te_nn <- rep(0, nrow(tr_te[-tri, ]))
+
+for (i in seq_along(skf)){
+  cat("\nFold:", i, "\n")
+  idx <- skf[[i]]
+  
+  X_tr <- X[-idx, ]; y_tr <- y[-idx]
+  X_val <- X[idx, ]; y_val <- y[idx]
+  
+  m_nn <- def_nn()
+  
+  m_nn %>% keras::fit(X_tr, y_tr,
+                      epochs = 100,
+                      batch_size = 4096,
+                      validation_data = list(X_val, y_val),
+                      callbacks = list(early_stopping, check_point),
+                      view_metrics = FALSE,
+                      verbose = 0)
+  
+  load_model_weights_hdf5(m_nn, "model.h5")
+  
+  pred_tr_nn[idx] <- predict(m_nn, X_val)
+  pred_te_nn <- pred_te_nn + predict(m_nn, X_te) / nfolds
+  
+  rm(m_nn, X_tr, X_val, y_tr, y_val); invisible(gc())
+}
+```
+```{r ks5, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+read_csv("../input/sample_submission.csv") %>%  
+  mutate(target = pred_te_nn) %>%
+  write_csv("tidy_keras_elo.csv")
+```
+
+# Ensemble learning
+Here we will use out-of-fold predictions obtained from the our models 
+to create more powerful models with more accurate predictions.
+
+## Optimal weighted mean 
+In this section I will use the **optim()** function to find optimal weights for each prediction. But first I
+need to define two functions - transformation and objective:  
+```{r opt1, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+fn_trn <- function(m, w) rowSums(m * matrix(w, nrow = nrow(m), ncol = ncol(m), byrow = T))
+```
+```{r opt2, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+fn_opt <- function(w) rmse(y, fn_trn(tr, w))
+```
+The next step is to combine train and test predictions from different models:
+```{r opt3, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+tr <- cbind(pred_tr_gbm, pred_tr_xgb, pred_tr_nn) 
+te <- cbind(pred_te_gbm, pred_te_xgb, pred_te_nn)
+
+colnames(tr) <- colnames(te) <- c("gbm", "xgb", "nn")
+```
+I randomly initialize the vector with weights:
+```{r opt4, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+n <- ncol(tr)
+w <- rep(1 / n, n) + runif(n , -0.01, 0.01)
+```
+Here I use a conjugate gradients method to find optimal weights:
+```{r opt5, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+opt <- optim(w, fn_opt, method = "CG")
+cat("\nOptimal weights:", opt$par)
+```
+The optimal combination of predictions can be found using **fn_trn()** function:
+```{r opt6, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+pred_tr_wm <- fn_trn(tr, opt$par)
+pred_te_wm <- fn_trn(te, opt$par)
+
+read_csv("../input/sample_submission.csv") %>%  
+  mutate(target = pred_te_wm) %>%
+  write_csv("tidy_elo_opt_mean.csv")
+```
+
+## Genetic optimization
+In this section I will use genetic optimization to find optimal weights. Here we can reuse functions defined in 
+the previous section:
+```{r ga1, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+opt_ga <- ga(type = "real-valued", 
+             fitness = function(w) -fn_opt(w),
+             min = rep(-5, n), 
+             max = rep(5, n), 
+             popSize = 100, 
+             pcrossover = 0.8, 
+             pmutation = 0.25, 
+             maxiter = 100, 
+             run = 10,
+             optim = T,
+             optimArgs = list(method = "Nelder-Mead", 
+                              poptim = 0.15,
+                              pressel = 0.5,
+                              control = list(maxit = 1000)))
+
+summary(opt_ga)
+```
+```{r ga2, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+w <- drop(opt_ga@solution)
+
+pred_tr_ga <- fn_trn(tr, w)
+pred_te_ga <- fn_trn(te, w)
+
+read_csv("../input/sample_submission.csv") %>%  
+  mutate(target = pred_te_ga) %>%
+  write_csv("tidy_elo_opt_ga.csv")
+```
+As we can see the weights calculated by genetic algorithm are close to the ones calculated by the 
+conjugate gradients method.
+
+## Random Forest
+In this section I will use random forest to create an ensemble model - maybe, 
+we'll be able to obtain more accurate predictions:
+```{r rfe1, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+m_rfe <- lgb.train(params = list(boosting_type = "rf",
+                                 objective = "regression_l2",
+                                 metric ="rmse",
+                                 nthread = 4,
+                                 num_leaves = 30,
+                                 sub_feature = 0.8,
+                                 sub_row = 0.5,
+                                 bagging_freq = 1),
+                   lgb.Dataset(data = tr, label = y), 100, verbose = -1)
+```
+```{r rfe2, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+pred_tr_rfe <- predict(m_rfe, tr)
+pred_te_rfe <- predict(m_rfe, te)
+
+read_csv("../input/sample_submission.csv") %>%  
+  mutate(target = pred_te_rfe) %>%
+  write_csv("tidy_elo_opt_rf.csv")
+```
+```{r rfe3, result='asis', message=FALSE, warning=FALSE, echo=TRUE, fig.height=2}
+plot_imp(lgb.importance(m_rfe), "RF Ensemble") 
+```
+
+## Distribution of predictions
+Let's compare predictions for the train set:
+```{r pr_cmp1, result='asis', message=FALSE, warning=FALSE, echo=FALSE, fig.height = 6}
+tibble(gbm = pred_tr_gbm, xgb = pred_tr_xgb, nn = pred_tr_nn, w_mean = pred_tr_wm, w_ga_mean = pred_tr_ga, y_true = y) %>% 
+  gather() %>% 
+  ggplot(aes(x = value, fill = key)) +
+  geom_histogram(binwidth = .05, alpha=.8, position="identity") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  facet_grid(key~.,  scales = "free", space = "fixed") +
+  scale_x_continuous(limits = c(-35, 10))+
+  labs(x = "prediction")
+```
+
+Although the distributions are quite similar they have some 
+peculiarities. It appears that the GBM and XGB models on their own give better score than any ensemble model. 
+There is definitely something wrong with the neural net model. Also all models are
+not able to predict outliers. 
+
+Let's peek at the NN predictions:
+```{r pr_cmp2, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+summary(pred_tr_nn)
+```
+The IQR differs from the IQR of the target variable. 
+In the next section I'll train an ensemble model without the NN predicitons.
+
+## Optimal weights for GBM and XGB
+```{r opt21, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+tr <- cbind(pred_tr_gbm, pred_tr_xgb) 
+te <- cbind(pred_te_gbm, pred_te_xgb)
+
+colnames(tr) <- colnames(te) <- c("gbm", "xgb")
+```
+```{r opt22, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+n <- ncol(tr)
+w <- rep(1 / n, n) + runif(n , -0.01, 0.01)
+```
+```{r opt23, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+opt <- optim(w, fn_opt, method = "CG")
+cat("\nOptimal weights:", opt$par)
+```
+```{r opt24, result='asis', message=FALSE, warning=FALSE, echo=TRUE}
+pred_tr_wm2 <- fn_trn(tr, opt$par)
+pred_te_wm2 <- fn_trn(te, opt$par)
+
+read_csv("../input/sample_submission.csv") %>%  
+  mutate(target = pred_te_wm2) %>%
+  write_csv("tidy_elo_opt_mean_final.csv")
+```
+```{r opt25, result='asis', message=FALSE, warning=FALSE, echo=FALSE}
+bind_rows(tibble(value = pred_tr_wm2, key = "Train"),
+          tibble(value = pred_te_wm2, key = "Test")) %>% 
+  ggplot(aes(x = value, fill = key)) +
+  geom_histogram(binwidth = .05, alpha = .8, position = "identity") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  facet_grid(key~.,  scales = "free", space = "fixed") +
+  labs(x = "prediction")
+```
+
+The RMSE of this model is around 3.695 while the errors of the GBM and XGB models are 3.697 and 3.698 respectively. 
